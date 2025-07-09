@@ -55,13 +55,19 @@ The commit message should be structured as follows:
 - An optional scope MAY be provided after a type. A scope is a phrase describing a section of the codebase enclosed in parenthesis, e.g., fix(parser):
 - A description MUST immediately follow the type/scope prefix. The description is a short description of the code changes, e.g., fix: array parsing issue when multiple spaces were contained in string.
 - Try to limit the whole subject line to 60 characters
-- Try to limit the body line number to 72 characters
 - Capitalize the subject line
 - Do not end the subject line with any punctuation
 - A longer commit body MAY be provided after the short description, providing additional contextual information about the code changes. The body MUST begin one blank line after the description.
 - Use the imperative mood in the subject line
 - Keep the body short and concise (omit it entirely if not useful)"
   "A prompt adapted from Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/).")
+
+(defcustom gptel-magit-body-length nil
+  "Maximum character length for commit message body lines.
+If nil, no body length constraint is mentioned in the prompt."
+  :type '(choice (const :tag "No constraint" nil)
+                 (integer :tag "Character limit"))
+  :group 'gptel-magit)
 
 (defcustom gptel-magit-commit-prompt
   gptel-magit-prompt-conventional-commits
@@ -110,6 +116,17 @@ See `gptel-backend` for documentation."
       (fill-region (point-min) end-of-first-line))
     (buffer-string)))
 
+(defun gptel-magit--get-commit-prompt ()
+  "Get the commit prompt, potentially modified based on configuration."
+  (cond
+   ;; If using conventional commits and body length is set, append the body length line
+   ((and (string= gptel-magit-commit-prompt gptel-magit-prompt-conventional-commits)
+         gptel-magit-body-length)
+    (concat gptel-magit-prompt-conventional-commits
+            (format "\n- Try to limit the body line number to %d characters" gptel-magit-body-length)))
+   ;; For all other cases, use the prompt as-is
+   (t gptel-magit-commit-prompt)))
+
 (defun gptel-magit--request (&rest args)
   "Call `gptel-request` with ARGS.
 
@@ -124,7 +141,7 @@ Respects configured model/backend options."
 Invokes CALLBACK with the generated message when done."
   (let ((diff (magit-git-output "diff" "--cached")))
     (gptel-magit--request diff
-      :system gptel-magit-commit-prompt
+      :system (gptel-magit--get-commit-prompt)
       :context nil
       :callback (lambda (response _info)
                   (let ((msg (gptel-magit--format-commit-message response)))
