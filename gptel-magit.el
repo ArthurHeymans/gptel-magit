@@ -12,7 +12,7 @@
 ;;; Commentary:
 
 ;; This package uses the gptel library to add LLM integration into
-;; magit. Currently, it adds functionality for generating commit
+;; magit.  Currently, it adds functionality for generating commit
 ;; messages.
 
 ;;; Code:
@@ -142,6 +142,33 @@ Respects configured model/backend options."
          (gptel-model (or gptel-magit-model gptel-model)))
     (apply #'gptel-request args)))
 
+(defun gptel-magit--streaming-callback (callback &optional what transform)
+  "Return a gptel streaming callback for CALLBACK.
+Call CALLBACK once, after all streaming chunks arrive.  WHAT is
+used in diagnostic messages.  TRANSFORM, when non-nil, is applied
+to the completed response before CALLBACK is called."
+  (let ((chunks nil)
+        (what (or what "response")))
+    (lambda (response info)
+      (cond
+       ((and (stringp response) (plist-get info :stream))
+        (push response chunks))
+       ((stringp response)
+        (funcall callback (if transform (funcall transform response) response)))
+       ((eq response t)
+        (let ((text (apply #'concat (nreverse chunks))))
+          (funcall callback (if transform (funcall transform text) text))))
+       ((and (consp response) (eq (car response) 'reasoning))
+        nil)
+       ((plist-get info :error)
+        (message "gptel-magit: Error generating %s: %s"
+                 what
+                 (or (plist-get (plist-get info :error) :message)
+                     (plist-get info :error))))
+       ((null response)
+        (message "gptel-magit: Empty %s from LLM (%s)"
+                 what (or (plist-get info :status) "unknown status")))))))
+
 (defun gptel-magit--generate (callback &optional rationale)
   "Generate a commit message for current magit repo.
 Invokes CALLBACK with the generated message when done.
@@ -153,16 +180,9 @@ Optional RATIONALE provides context for why the change was made."
     (gptel-magit--request prompt
       :system (gptel-magit--get-commit-prompt)
       :context nil
-      :callback (lambda (response info)
-                  (cond
-                   ((stringp response)
-                    (let ((msg (gptel-magit--format-commit-message response)))
-                      (funcall callback msg)))
-                   ((and (consp response) (eq (car response) 'reasoning))
-                    nil) ; silently ignore reasoning traces
-                   ((null response)
-                    (message "gptel-magit: Empty response from LLM (%s)"
-                             (or (plist-get info :status) "unknown status"))))))))
+      :stream t
+      :callback (gptel-magit--streaming-callback
+                 callback "commit message" #'gptel-magit--format-commit-message))))
 
 (defun gptel-magit-generate-message ()
   "Generate a commit message when in the git commit buffer."
@@ -204,15 +224,9 @@ Uses ARGS from transient mode."
   (gptel-magit--request diff
     :system gptel-magit-diff-explain-prompt
     :context nil
-    :callback (lambda (response info)
-                (cond
-                 ((stringp response)
-                  (gptel-magit--show-diff-explain response))
-                 ((and (consp response) (eq (car response) 'reasoning))
-                  nil)
-                 ((null response)
-                  (message "gptel-magit: Empty response from LLM (%s)"
-                           (or (plist-get info :status) "unknown status"))))))
+    :stream t
+    :callback (gptel-magit--streaming-callback
+               #'gptel-magit--show-diff-explain "diff explanation"))
   (message "magit-gptel: Explaining diff..."))
 
 (defun gptel-magit-diff-explain ()
