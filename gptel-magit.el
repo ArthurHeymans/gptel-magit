@@ -12,13 +12,15 @@
 ;;; Commentary:
 
 ;; This package uses the gptel library to add LLM integration into
-;; magit. Currently, it adds functionality for generating commit
+;; magit.  Currently, it adds functionality for generating commit
 ;; messages.
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'gptel)
 (require 'magit)
+(require 'subr-x)
 
 (defconst gptel-magit-prompt-zed
   "You are an expert at writing Git commits. Your job is to write a short clear commit message that summarizes the changes.
@@ -84,6 +86,19 @@ The prompt should consider that the input will be a diff some changes."
   :type 'string
   :group 'gptel-magit)
 
+(defcustom gptel-magit-tag-prompt
+  "You are an expert at writing annotated Git tag messages.
+Your job is to write a clear, concise release summary for the changes between a previous tag and the new tag target.
+
+Use the supplied commit list, diffstat, and diff to identify the notable changes. Prefer a short title followed by concise bullet points when useful.
+
+Only return the tag message. Do not include any additional meta-commentary about the task. Do not include the raw diff output in the tag message."
+  "The prompt to use for generating annotated tag messages.
+The input contains the previous tag, the new tag target, commit
+subjects, a diffstat, and the diff between those revisions."
+  :type 'string
+  :group 'gptel-magit)
+
 (custom-declare-variable
  'gptel-magit-model nil
  "The gptel model to use, defaults to `gptel-model` if nil.
@@ -110,6 +125,9 @@ See `gptel-backend` for documentation."
 
 (defvar gptel-magit--current-commit-buffer nil
   "Buffer where commit message is being generated.")
+
+(defvar-local gptel-magit--rationale-submit-function nil
+  "Function called with rationale text from `gptel-magit-rationale-mode'.")
 
 (defun gptel-magit--format-commit-message (message)
   "Format commit message MESSAGE nicely."
@@ -142,6 +160,33 @@ Respects configured model/backend options."
          (gptel-model (or gptel-magit-model gptel-model)))
     (apply #'gptel-request args)))
 
+(defun gptel-magit--streaming-callback (callback &optional what transform)
+  "Return a gptel streaming callback for CALLBACK.
+Call CALLBACK once, after all streaming chunks arrive.  WHAT is
+used in diagnostic messages.  TRANSFORM, when non-nil, is applied
+to the completed response before CALLBACK is called."
+  (let ((chunks nil)
+        (what (or what "response")))
+    (lambda (response info)
+      (cond
+       ((and (stringp response) (plist-get info :stream))
+        (push response chunks))
+       ((stringp response)
+        (funcall callback (if transform (funcall transform response) response)))
+       ((eq response t)
+        (let ((text (apply #'concat (nreverse chunks))))
+          (funcall callback (if transform (funcall transform text) text))))
+       ((and (consp response) (eq (car response) 'reasoning))
+        nil)
+       ((plist-get info :error)
+        (message "gptel-magit: Error generating %s: %s"
+                 what
+                 (or (plist-get (plist-get info :error) :message)
+                     (plist-get info :error))))
+       ((null response)
+        (message "gptel-magit: Empty %s from LLM (%s)"
+                 what (or (plist-get info :status) "unknown status")))))))
+
 (defun gptel-magit--generate (callback &optional rationale)
   "Generate a commit message for current magit repo.
 Invokes CALLBACK with the generated message when done.
@@ -153,28 +198,145 @@ Optional RATIONALE provides context for why the change was made."
     (gptel-magit--request prompt
       :system (gptel-magit--get-commit-prompt)
       :context nil
-      :callback (lambda (response info)
-                  (cond
-                   ((stringp response)
-                    (let ((msg (gptel-magit--format-commit-message response)))
-                      (funcall callback msg)))
-                   ((and (consp response) (eq (car response) 'reasoning))
-                    nil) ; silently ignore reasoning traces
-                   ((null response)
-                    (message "gptel-magit: Empty response from LLM (%s)"
-                             (or (plist-get info :status) "unknown status"))))))))
+      :stream t
+      :callback (gptel-magit--streaming-callback
+                 callback "commit message" #'gptel-magit--format-commit-message))))
+
+(defun gptel-magit--tag-message-buffer-p ()
+  "Return non-nil if the current buffer edits a Git tag message."
+  (and buffer-file-name
+       (string= (file-name-nondirectory buffer-file-name) "TAG_EDITMSG")))
+
+(defun gptel-magit--format-tag-message (message)
+  "Format generated tag MESSAGE for insertion."
+  (concat (string-trim-right message) "\n"))
+
+(defun gptel-magit--insert-message-at-top (message)
+  "Insert MESSAGE at the top of the current message buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (insert (string-trim-right message) "\n\n")))
+
+(defun gptel-magit--read-previous-tag (target)
+  "Read the previous tag to compare against TARGET."
+  (magit-completing-read
+   (format "Previous tag for %s" target)
+   (magit-list-tags) nil t nil 'magit-revision-history
+   (magit-get-current-tag target)))
+
+(defun gptel-magit--read-tag-generation-args (&optional args)
+  "Read arguments needed to create a generated annotated tag.
+ARGS are the active `magit-tag' transient arguments."
+  (let* ((args (or args (magit-tag-arguments)))
+         (tag (magit-completing-read "Create tag" (magit-list-tags)))
+         (target (magit-read-branch-or-commit "Place tag on"))
+         (previous (gptel-magit--read-previous-tag target)))
+    (list tag target previous args)))
+
+(defun gptel-magit--tag-request-text (previous target tag rationale)
+  "Build the tag-generation request for PREVIOUS..TARGET.
+TAG is the tag being generated, or nil when generating inside an
+existing tag message buffer.  Optional RATIONALE provides extra
+user context."
+  (let* ((range (format "%s..%s" previous target))
+         (commits (magit-git-output "log" "--reverse" "--format=%h %s" range))
+         (stat (magit-git-output "diff" "--stat" previous target))
+         (diff (magit-git-output "diff" previous target)))
+    (concat
+     (and tag (format "New tag: %s\n" tag))
+     (format "Previous tag: %s\nNew tag target: %s\nRange: %s\n\n"
+             previous target range)
+     (and (and rationale (not (string-empty-p rationale)))
+          (format "Release rationale: %s\n\n" rationale))
+     "Commits:\n" commits "\n\n"
+     "Diffstat:\n" stat "\n\n"
+     "Diff:\n" diff)))
+
+(defun gptel-magit--generate-tag-message (previous target callback
+                                                   &optional tag rationale)
+  "Generate a tag message for PREVIOUS..TARGET.
+Invoke CALLBACK with the generated message.  Optional TAG is the
+new tag name, and optional RATIONALE gives user context."
+  (gptel-magit--request
+      (gptel-magit--tag-request-text previous target tag rationale)
+    :system gptel-magit-tag-prompt
+    :context nil
+    :stream t
+    :callback (gptel-magit--streaming-callback
+               callback "tag message" #'gptel-magit--format-tag-message)))
+
+(defun gptel-magit--tag-annotated-arg-p (arg)
+  "Return non-nil if ARG requests an annotated tag."
+  (and (stringp arg)
+       (string-match-p "\\`--\\(annotate\\|sign\\|local-user\\)" arg)))
+
+(defun gptel-magit--tag-create-with-message (tag target previous args
+                                                 &optional rationale)
+  "Create TAG at TARGET using a generated message since PREVIOUS.
+ARGS are the active `magit-tag' transient arguments.  Optional
+RATIONALE provides extra context for generation."
+  (let ((args (copy-sequence args)))
+    (unless (cl-some #'gptel-magit--tag-annotated-arg-p args)
+      (cl-pushnew "--annotate" args :test #'equal))
+    (cl-pushnew "--edit" args :test #'equal)
+    (gptel-magit--generate-tag-message
+     previous target
+     (lambda (message)
+       (magit-run-git-with-editor "tag" args (list "-m" message) tag target))
+     tag rationale))
+  (message "magit-gptel: Generating tag message..."))
+
+(defun gptel-magit--generate-tag-message-in-buffer (&optional rationale)
+  "Generate a tag message into the current tag edit buffer.
+Optional RATIONALE provides extra context for generation.  The tag
+target defaults to HEAD because Git does not expose the pending tag
+object in TAG_EDITMSG."
+  (let* ((buffer (current-buffer))
+         (target "HEAD")
+         (previous (gptel-magit--read-previous-tag target)))
+    (gptel-magit--generate-tag-message
+     previous target
+     (lambda (message)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (gptel-magit--insert-message-at-top message))))
+     nil rationale))
+  (message "magit-gptel: Generating tag message..."))
+
+(defun gptel-magit-tag-generate (&optional args)
+  "Create an annotated tag with a generated tag message.
+Uses ARGS from the `magit-tag' transient."
+  (interactive (list (magit-tag-arguments)))
+  (pcase-let ((`(,tag ,target ,previous ,args)
+               (gptel-magit--read-tag-generation-args args)))
+    (gptel-magit--tag-create-with-message tag target previous args)))
+
+(defun gptel-magit-tag-generate-with-rationale (&optional args)
+  "Create an annotated tag with a generated tag message and rationale.
+Uses ARGS from the `magit-tag' transient."
+  (interactive (list (magit-tag-arguments)))
+  (pcase-let ((`(,tag ,target ,previous ,args)
+               (gptel-magit--read-tag-generation-args args)))
+    (gptel-magit--prompt-for-rationale
+     (lambda (rationale)
+       (gptel-magit--tag-create-with-message
+        tag target previous args rationale)))))
 
 (defun gptel-magit-generate-message ()
-  "Generate a commit message when in the git commit buffer."
+  "Generate a commit or tag message in a Git message buffer."
   (interactive)
-  (unless (magit-commit-message-buffer)
-    (user-error "No commit in progress"))
-  (gptel-magit--generate (lambda (message)
-                           (with-current-buffer (magit-commit-message-buffer)
-                             (save-excursion
-                               (goto-char (point-min))
-                               (insert message)))))
-  (message "magit-gptel: Generating commit message..."))
+  (cond
+   ((gptel-magit--tag-message-buffer-p)
+    (gptel-magit--generate-tag-message-in-buffer))
+   ((magit-commit-message-buffer)
+    (gptel-magit--generate (lambda (message)
+                             (with-current-buffer (magit-commit-message-buffer)
+                               (save-excursion
+                                 (goto-char (point-min))
+                                 (insert message)))))
+    (message "magit-gptel: Generating commit message..."))
+   (t
+    (user-error "No commit or tag message in progress"))))
 
 (defun gptel-magit-commit-generate (&optional args)
   "Create a new commit with a generated commit message.
@@ -204,15 +366,9 @@ Uses ARGS from transient mode."
   (gptel-magit--request diff
     :system gptel-magit-diff-explain-prompt
     :context nil
-    :callback (lambda (response info)
-                (cond
-                 ((stringp response)
-                  (gptel-magit--show-diff-explain response))
-                 ((and (consp response) (eq (car response) 'reasoning))
-                  nil)
-                 ((null response)
-                  (message "gptel-magit: Empty response from LLM (%s)"
-                           (or (plist-get info :status) "unknown status"))))))
+    :stream t
+    :callback (gptel-magit--streaming-callback
+               #'gptel-magit--show-diff-explain "diff explanation"))
   (message "magit-gptel: Explaining diff..."))
 
 (defun gptel-magit-diff-explain ()
@@ -231,10 +387,11 @@ Uses ARGS from transient mode."
 
 (defun gptel-magit--setup-rationale-buffer ()
   "Setup the rationale buffer with proper guidance."
+  (setq-local gptel-magit--rationale-submit-function nil)
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert ";;; WHY are you making these changes? (optional)\n")
-    (insert ";;; Press C-c C-c to generate commit message, C-c C-k to cancel\n")
+    (insert ";;; Press C-c C-c to generate message, C-c C-k to cancel\n")
     (insert ";;; Leave empty to generate without rationale\n")
     (insert ";;; ────────────────────────────────────────────────────────\n")
     (add-text-properties (point-min) (point)
@@ -242,8 +399,17 @@ Uses ARGS from transient mode."
     (insert "\n")
     (goto-char (point-max))))
 
+(defun gptel-magit--prompt-for-rationale (submit-function)
+  "Prompt for rationale and call SUBMIT-FUNCTION with the result."
+  (let ((buffer (get-buffer-create gptel-magit-rationale-buffer)))
+    (with-current-buffer buffer
+      (gptel-magit-rationale-mode)
+      (gptel-magit--setup-rationale-buffer)
+      (setq-local gptel-magit--rationale-submit-function submit-function))
+    (pop-to-buffer buffer)))
+
 (defun gptel-magit--submit-rationale ()
-  "Submit the rationale buffer content and proceed with commit generation."
+  "Submit the rationale buffer content and proceed with generation."
   (interactive)
   (let ((rationale (string-trim
                     (buffer-substring-no-properties
@@ -253,16 +419,19 @@ Uses ARGS from transient mode."
                                    (get-text-property (point) 'read-only))
                          (forward-char))
                        (point))
-                     (point-max)))))
+                     (point-max))))
+        (submit-function gptel-magit--rationale-submit-function))
     (quit-window t)
-    (gptel-magit--generate
-     (lambda (message)
-       (with-current-buffer gptel-magit--current-commit-buffer
-         (save-excursion
-           (goto-char (point-min))
-           (insert message))))
-     rationale)
-    (message "magit-gptel: Generating commit message with rationale...")))
+    (if submit-function
+        (funcall submit-function rationale)
+      (gptel-magit--generate
+       (lambda (message)
+         (with-current-buffer gptel-magit--current-commit-buffer
+           (save-excursion
+             (goto-char (point-min))
+             (insert message))))
+       rationale)
+      (message "magit-gptel: Generating commit message with rationale..."))))
 
 (defun gptel-magit--cancel-rationale ()
   "Cancel rationale input and abort commit generation."
@@ -271,16 +440,25 @@ Uses ARGS from transient mode."
   (message "Commit generation canceled."))
 
 (defun gptel-magit-generate-message-with-rationale ()
-  "Generate a commit message with rationale when in the git commit buffer."
+  "Generate a commit or tag message with rationale."
   (interactive)
-  (unless (magit-commit-message-buffer)
-    (user-error "No commit in progress"))
-  (setq gptel-magit--current-commit-buffer (magit-commit-message-buffer))
-  (let ((buffer (get-buffer-create gptel-magit-rationale-buffer)))
-    (with-current-buffer buffer
-      (gptel-magit-rationale-mode)
-      (gptel-magit--setup-rationale-buffer))
-    (pop-to-buffer buffer)))
+  (cond
+   ((gptel-magit--tag-message-buffer-p)
+    (let ((buffer (current-buffer)))
+      (gptel-magit--prompt-for-rationale
+       (lambda (rationale)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (gptel-magit--generate-tag-message-in-buffer rationale)))))))
+   ((magit-commit-message-buffer)
+    (setq gptel-magit--current-commit-buffer (magit-commit-message-buffer))
+    (let ((buffer (get-buffer-create gptel-magit-rationale-buffer)))
+      (with-current-buffer buffer
+        (gptel-magit-rationale-mode)
+        (gptel-magit--setup-rationale-buffer))
+      (pop-to-buffer buffer)))
+   (t
+    (user-error "No commit or tag message in progress"))))
 
 (defun gptel-magit-commit-generate-with-rationale (&optional args)
   "Create a new commit with a generated commit message with rationale.
@@ -320,6 +498,10 @@ Uses ARGS from transient mode."
     '("g" "Generate commit" gptel-magit-commit-generate))
   (transient-append-suffix 'magit-commit #'gptel-magit-commit-generate
     '("r" "Generate with rationale" gptel-magit-commit-generate-with-rationale))
+  (transient-append-suffix 'magit-tag #'magit-tag-create
+    '("g" "Generate tag" gptel-magit-tag-generate))
+  (transient-append-suffix 'magit-tag #'gptel-magit-tag-generate
+    '("R" "Generate with rationale" gptel-magit-tag-generate-with-rationale))
   (transient-append-suffix 'magit-diff #'magit-stash-show
     '("x" "Explain" gptel-magit-diff-explain)))
 
